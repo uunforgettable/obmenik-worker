@@ -1,0 +1,84 @@
+name: Work chunk
+
+# Помощник: Actions -> Work chunk -> Run workflow -> вписать номер куска, который назвал владелец проекта.
+on:
+  workflow_dispatch:
+    inputs:
+      chunk:
+        description: "Номер куска, который тебе назвали (например c0001 или s0001)"
+        required: true
+
+concurrency:
+  group: work
+  cancel-in-progress: false
+
+permissions:
+  contents: write     # чтобы выложить результат релизом в этом репозитории
+
+env:
+  HUB_REPO: uunforgettable/obmenik-worker    # публичный репозиторий, где лежат куски (задаёт владелец проекта)
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install httpx
+
+      - name: Download chunk
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHUNK: ${{ inputs.chunk }}
+        run: |
+          if ! [[ "$CHUNK" =~ ^[cs][0-9]{4}$ ]]; then echo "::error::Номер куска должен выглядеть как c0001 или s0001"; exit 1; fi
+          gh release download queue -R "$HUB_REPO" --pattern index.json --pattern "chunk_${CHUNK}.json.gz" --clobber
+          python - <<'PY'
+          import json, os, sys
+          idx = json.load(open("index.json", encoding="utf-8"))
+          if idx.get("paused"):
+              sys.exit("Работа сейчас приостановлена владельцем проекта. Попробуй позже.")
+          ids = [c["id"] for c in idx["chunks"]]
+          if os.environ["CHUNK"] not in ids:
+              sys.exit(f"Куска {os.environ['CHUNK']} нет в списке активных: {ids}")
+          p = idx["params"]
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"DELAY={p['delay']}\nWORKERS={p['workers']}\nMAX_DEPTH={p['max_depth']}\nHOURS={p['hours']}\n")
+          PY
+
+      - name: Prepare
+        env:
+          CHUNK: ${{ inputs.chunk }}
+        run: python prepare_chunk.py "chunk_${CHUNK}.json.gz"
+
+      - name: Crawl
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          KIND=$(cat kind.txt)
+          EXTRA=""
+          if [ "$KIND" = "search" ]; then EXTRA="--discover --max-depth $MAX_DEPTH"; fi
+          echo "Тип куска: $KIND. Пауза $DELAY, потоков $WORKERS, максимум $HOURS ч."
+          set +e
+          timeout --signal=INT "${HOURS}h" python crawl.py --limit 1000000 --delay "$DELAY" --workers "$WORKERS" $EXTRA
+          code=$?
+          echo "Код завершения: $code"
+          if [ "$code" -ne 0 ] && [ "$code" -ne 124 ]; then exit "$code"; fi
+
+      - name: Pack and publish result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHUNK: ${{ inputs.chunk }}
+        run: |
+          pkill -INT -f "python crawl.py" || true
+          sleep 5
+          pkill -9 -f "python crawl.py" || true
+          python pack_result.py "$CHUNK" "$(cat kind.txt)"
+          gh release create "result-${CHUNK}-${GITHUB_RUN_ID}" result_seed.db.gz result_cards.db.gz meta.json \
+            --title "Результат ${CHUNK}" --notes "Результат работы над куском ${CHUNK}. Забирается автоматически."
