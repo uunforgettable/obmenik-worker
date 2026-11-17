@@ -1,12 +1,14 @@
 name: Work chunk
 
-# Помощник: Actions -> Work chunk -> Run workflow -> вписать номер куска, который назвал владелец проекта.
+# Помощник: Actions -> Work chunk -> Run workflow. Ничего вводить не нужно:
+# кусок, назначенный твоему репозиторию, определяется автоматически.
 on:
   workflow_dispatch:
     inputs:
       chunk:
-        description: "Номер куска, который тебе назвали (например c0001 или s0001)"
-        required: true
+        description: "Номер куска (необязательно; оставь пустым, возьмётся назначенный тебе)"
+        required: false
+        default: ""
 
 concurrency:
   group: work
@@ -31,29 +33,44 @@ jobs:
 
       - run: pip install httpx
 
-      - name: Download chunk
+      - name: Pick and download chunk
         env:
           GH_TOKEN: ${{ github.token }}
-          CHUNK: ${{ inputs.chunk }}
+          CHUNK_INPUT: ${{ inputs.chunk }}
+          ME: ${{ github.repository }}
         run: |
-          if ! [[ "$CHUNK" =~ ^[cs][0-9]{4}$ ]]; then echo "::error::Номер куска должен выглядеть как c0001 или s0001"; exit 1; fi
-          gh release download queue -R "$HUB_REPO" --pattern index.json --pattern "chunk_${CHUNK}.json.gz" --clobber
+          gh release download queue -R "$HUB_REPO" --pattern index.json --clobber
           python - <<'PY'
-          import json, os, sys
+          import json, os, re, sys
           idx = json.load(open("index.json", encoding="utf-8"))
           if idx.get("paused"):
               sys.exit("Работа сейчас приостановлена владельцем проекта. Попробуй позже.")
-          ids = [c["id"] for c in idx["chunks"]]
-          if os.environ["CHUNK"] not in ids:
-              sys.exit(f"Куска {os.environ['CHUNK']} нет в списке активных: {ids}")
+          me = os.environ["ME"].lower()
+          want = os.environ.get("CHUNK_INPUT", "").strip()
+          chunks = idx["chunks"]
+          if want:
+              if not re.fullmatch(r"[cs]\d{4}", want):
+                  sys.exit("Номер куска должен выглядеть как c0001 или s0001")
+              mine = [c for c in chunks if c["id"] == want]
+          else:
+              mine = [c for c in chunks if (c.get("assigned_to") or "").lower() == me]
+          if not mine:
+              sys.exit("Для тебя пока нет куска. Подожди, пока владелец проекта выдаст новый (обычно в течение пары часов), и попробуй позже.")
+          chunk = mine[0]["id"]
           p = idx["params"]
           with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"DELAY={p['delay']}\nWORKERS={p['workers']}\nMAX_DEPTH={p['max_depth']}\nHOURS={p['hours']}\n")
+              f.write(f"CHUNK={chunk}\nDELAY={p['delay']}\nWORKERS={p['workers']}\nMAX_DEPTH={p['max_depth']}\nHOURS={p['hours']}\n")
+          print("Твой кусок:", chunk)
           PY
+          source "$GITHUB_ENV" 2>/dev/null || true
+          CHUNK=$(grep '^CHUNK=' "$GITHUB_ENV" | cut -d= -f2)
+          # уже сдавал этот кусок? тогда ждём новый
+          if gh release list --json tagName -q '.[].tagName' | grep -q "^result-${CHUNK}-"; then
+            echo "::error::Кусок ${CHUNK} уже сдан. Подожди, пока владелец проекта выдаст новый."; exit 1
+          fi
+          gh release download queue -R "$HUB_REPO" --pattern "chunk_${CHUNK}.json.gz" --clobber
 
       - name: Prepare
-        env:
-          CHUNK: ${{ inputs.chunk }}
         run: python prepare_chunk.py "chunk_${CHUNK}.json.gz"
 
       - name: Crawl
@@ -74,7 +91,6 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-          CHUNK: ${{ inputs.chunk }}
         run: |
           pkill -INT -f "python crawl.py" || true
           sleep 5
